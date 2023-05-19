@@ -595,7 +595,7 @@ impl LocalTimeType {
     }
 
     /// Returns offset from UTC in seconds
-    pub(crate) const fn offset(&self) -> i32 {
+    pub(crate) const fn raw_offset(&self) -> i32 {
         self.ut_offset
     }
 
@@ -860,7 +860,7 @@ mod tests {
             }
 
             let time_zone_utc = TimeZone::from_posix_tz("UTC")?;
-            assert_eq!(time_zone_utc.find_local_time_type(0)?.offset(), 0);
+            assert_eq!(time_zone_utc.find_local_time_type(0)?.raw_offset(), 0);
         }
 
         assert!(TimeZone::from_posix_tz("EST5EDT,0/0,J365/25").is_err());
