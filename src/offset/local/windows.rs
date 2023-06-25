@@ -15,8 +15,8 @@ use std::ptr;
 use winapi::um::minwinbase::SYSTEMTIME;
 use winapi::um::timezoneapi::{GetTimeZoneInformationForYear, TIME_ZONE_INFORMATION};
 
-use super::{FixedOffset, TzInfo};
-use crate::{Datelike, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, Weekday};
+use crate::offset::local::{lookup_with_dst_transitions, Transition};
+use crate::{Datelike, FixedOffset, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, Weekday};
 
 // We don't use `SystemTimeToTzSpecificLocalTime` because it doesn't support the same range of dates
 // as Chrono. Also it really isn't that difficult to work out the correct offset from the provided
@@ -61,7 +61,14 @@ pub(super) fn offset_from_local_datetime(local: &NaiveDateTime) -> LocalResult<F
         None => return LocalResult::None,
     };
     match (tz_info.std_transition, tz_info.dst_transition) {
-        (Some(_), Some(_)) => tz_info.lookup_with_dst_transitions(*local),
+        (Some(std_transition), Some(dst_transition)) => {
+            let mut transitions = [
+                Transition::new(std_transition, tz_info.std_offset, tz_info.dst_offset),
+                Transition::new(dst_transition, tz_info.dst_offset, tz_info.std_offset),
+            ];
+            transitions.sort_unstable();
+            lookup_with_dst_transitions(&transitions, *local)
+        }
         _ => LocalResult::Single(tz_info.std_offset),
     }
 }
@@ -72,6 +79,17 @@ pub(super) fn offset_from_local_datetime(local: &NaiveDateTime) -> LocalResult<F
 // - There are either zero or two DST transitions.
 // - As of Vista(?) only years from 2004 until a few years into the future are supported.
 // - All other years get the base settings, which seem to be that of the current year.
+struct TzInfo {
+    // Offset from UTC during standard time.
+    std_offset: FixedOffset,
+    // Offset from UTC during daylight saving time.
+    dst_offset: FixedOffset,
+    // Transition from standard time to daylight saving time, given in local standard time.
+    std_transition: Option<NaiveDateTime>,
+    // Transition from daylight saving time to standard time, given in local daylight saving time.
+    dst_transition: Option<NaiveDateTime>,
+}
+
 fn tz_info_for_year(year: i32) -> Option<TzInfo> {
     // The API limits years to 1601..=30827.
     // Working with timezones and daylight saving time this far into the past or future makes

@@ -6,7 +6,7 @@ use super::{
     Error, CUMUL_DAY_IN_MONTHS_NORMAL_YEAR, DAYS_PER_WEEK, DAY_IN_MONTHS_NORMAL_YEAR,
     SECONDS_PER_DAY,
 };
-use crate::offset::local::TzInfo;
+use crate::offset::local::{lookup_with_dst_transitions, Transition};
 use crate::{FixedOffset, NaiveDateTime};
 
 /// Transition rule
@@ -240,22 +240,25 @@ impl AlternateTime {
             return Err(Error::OutOfRange("out of range date time"));
         }
 
-        let dst_start_transition =
-            self.dst_start.unix_time(current_year, 0) + i64::from(self.dst_start_time);
-        let dst_end_transition =
-            self.dst_end.unix_time(current_year, 0) + i64::from(self.dst_end_time);
-
-        let tz_info = TzInfo {
-            std_offset: self.std.offset(),
-            dst_offset: self.dst.offset(),
-            std_transition: Some(NaiveDateTime::from_timestamp_opt(dst_end_transition, 0).unwrap()),
-            dst_transition: Some(
-                NaiveDateTime::from_timestamp_opt(dst_start_transition, 0).unwrap(),
-            ),
-        };
-
+        let dst_start_transition = NaiveDateTime::from_timestamp_opt(
+            self.dst_start.unix_time(current_year, i64::from(self.dst_start_time)),
+            0,
+        )
+        .unwrap();
+        let dst_end_transition = NaiveDateTime::from_timestamp_opt(
+            self.dst_end.unix_time(current_year, i64::from(self.dst_end_time)),
+            0,
+        )
+        .unwrap();
         let local_datetime = NaiveDateTime::from_timestamp_opt(local_time, 0).unwrap();
-        Ok(tz_info.lookup_with_dst_transitions(local_datetime))
+
+        let mut transitions = [
+            Transition::new(dst_start_transition, self.std.offset(), self.dst.offset()),
+            Transition::new(dst_end_transition, self.dst.offset(), self.std.offset()),
+        ];
+        transitions.sort_unstable();
+
+        Ok(lookup_with_dst_transitions(&transitions, local_datetime))
     }
 }
 
