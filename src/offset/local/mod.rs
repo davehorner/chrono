@@ -3,6 +3,9 @@
 
 //! The local (system) time zone.
 
+#[cfg(any(unix, windows))]
+use std::cmp::Ordering;
+
 #[cfg(feature = "rkyv")]
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -155,11 +158,95 @@ impl TimeZone for Local {
     }
 }
 
+#[cfg(any(unix, windows))]
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct Transition {
+    transition_utc: NaiveDateTime,
+    offset_before: FixedOffset,
+    offset_after: FixedOffset,
+}
+
+#[cfg(any(unix, windows))]
+impl Transition {
+    fn new(
+        transition_local: NaiveDateTime,
+        offset_before: FixedOffset,
+        offset_after: FixedOffset,
+    ) -> Transition {
+        // FIXME: adding or substracting an offset can overflow if the transition date is very
+        // close to `NaiveDate::MIN` or `NaiveDate::MAX`.
+        Transition { transition_utc: transition_local - offset_before, offset_before, offset_after }
+    }
+
+    // Depending on the dst and std offsets, the result of a transition can have a local time that
+    // is before or after the start of the transition.
+    //
+    // We are interested in the earliest and latest local clock time of the transition, as this are
+    // the times between which times do not exist or are ambiguous.
+    fn transition_min_max(&self) -> (NaiveDateTime, NaiveDateTime) {
+        // FIXME: adding or substracting an offset can overflow if the transition date is very
+        // close to `NaiveDate::MIN` or `NaiveDate::MAX`.
+        if self.offset_after.local_minus_utc() > self.offset_before.local_minus_utc() {
+            (self.transition_utc + self.offset_before, self.transition_utc + self.offset_after)
+        } else {
+            (self.transition_utc + self.offset_after, self.transition_utc + self.offset_before)
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl PartialOrd for Transition {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.transition_utc.cmp(&other.transition_utc))
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl Ord for Transition {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.transition_utc.cmp(&other.transition_utc)
+    }
+}
+
+// Calculate the time in UTC given a local time, and transitions.
+// `transitions` must be sorted.
+#[cfg(any(unix, windows))]
+fn lookup_with_dst_transitions(
+    transitions: &[Transition],
+    dt: NaiveDateTime,
+) -> LocalResult<FixedOffset> {
+    for t in transitions.iter() {
+        let (transition_min, transition_max) = t.transition_min_max();
+        if dt < transition_min {
+            return LocalResult::Single(t.offset_before);
+        } else if dt <= transition_max {
+            return match t.offset_after.local_minus_utc().cmp(&t.offset_before.local_minus_utc()) {
+                Ordering::Equal => LocalResult::Single(t.offset_before),
+                Ordering::Less => LocalResult::Ambiguous(t.offset_before, t.offset_after),
+                Ordering::Greater => {
+                    if dt == transition_min {
+                        LocalResult::Single(t.offset_before)
+                    } else if dt == transition_max {
+                        LocalResult::Single(t.offset_after)
+                    } else {
+                        LocalResult::None
+                    }
+                }
+            };
+        }
+    }
+    LocalResult::Single(transitions.last().unwrap().offset_after)
+}
+
 #[cfg(test)]
 mod tests {
     use super::Local;
+    #[cfg(any(unix, windows))]
+    use crate::offset::local::{lookup_with_dst_transitions, Transition};
     use crate::offset::TimeZone;
-    use crate::{Datelike, TimeDelta, Utc};
+    use crate::{Datelike, Duration, Utc};
+    #[cfg(any(unix, windows))]
+    use crate::{FixedOffset, LocalResult, NaiveDate};
 
     #[test]
     fn verify_correct_offsets() {
@@ -177,7 +264,7 @@ mod tests {
     #[test]
     fn verify_correct_offsets_distant_past() {
         // let distant_past = Local::now() - Duration::days(365 * 100);
-        let distant_past = Local::now() - TimeDelta::days(250 * 31);
+        let distant_past = Local::now() - Duration::days(365 * 500);
         let from_local = Local.from_local_datetime(&distant_past.naive_local()).unwrap();
         let from_utc = Local.from_utc_datetime(&distant_past.naive_utc());
 
@@ -190,7 +277,7 @@ mod tests {
 
     #[test]
     fn verify_correct_offsets_distant_future() {
-        let distant_future = Local::now() + TimeDelta::days(250 * 31);
+        let distant_future = Local::now() + Duration::days(365 * 35000);
         let from_local = Local.from_local_datetime(&distant_future.naive_local()).unwrap();
         let from_utc = Local.from_utc_datetime(&distant_future.naive_utc());
 
@@ -234,5 +321,126 @@ mod tests {
                 timestr
             );
         }
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn test_lookup_with_dst_transitions() {
+        let ymdhms = |y, m, d, h, n, s| {
+            NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, n, s).unwrap()
+        };
+
+        #[track_caller]
+        #[allow(clippy::too_many_arguments)]
+        fn compare_lookup(
+            transitions: &[Transition],
+            y: i32,
+            m: u32,
+            d: u32,
+            h: u32,
+            n: u32,
+            s: u32,
+            result: LocalResult<FixedOffset>,
+        ) {
+            let dt = NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(h, n, s).unwrap();
+            assert_eq!(lookup_with_dst_transitions(transitions, dt), result);
+        }
+
+        // dst transition before std transition
+        // dst offset > std offset
+        let std = FixedOffset::east_opt(3 * 60 * 60).unwrap();
+        let dst = FixedOffset::east_opt(4 * 60 * 60).unwrap();
+        let transitions = [
+            Transition::new(ymdhms(2023, 3, 26, 2, 0, 0), std, dst),
+            Transition::new(ymdhms(2023, 10, 29, 3, 0, 0), dst, std),
+        ];
+        compare_lookup(&transitions, 2023, 3, 26, 1, 0, 0, LocalResult::Single(std));
+        compare_lookup(&transitions, 2023, 3, 26, 2, 0, 0, LocalResult::Single(std));
+        compare_lookup(&transitions, 2023, 3, 26, 2, 30, 0, LocalResult::None);
+        compare_lookup(&transitions, 2023, 3, 26, 3, 0, 0, LocalResult::Single(dst));
+        compare_lookup(&transitions, 2023, 3, 26, 4, 0, 0, LocalResult::Single(dst));
+
+        compare_lookup(&transitions, 2023, 10, 29, 1, 0, 0, LocalResult::Single(dst));
+        compare_lookup(&transitions, 2023, 10, 29, 2, 0, 0, LocalResult::Ambiguous(dst, std));
+        compare_lookup(&transitions, 2023, 10, 29, 2, 30, 0, LocalResult::Ambiguous(dst, std));
+        compare_lookup(&transitions, 2023, 10, 29, 3, 0, 0, LocalResult::Ambiguous(dst, std));
+        compare_lookup(&transitions, 2023, 10, 29, 4, 0, 0, LocalResult::Single(std));
+
+        // std transition before dst transition
+        // dst offset > std offset
+        let std = FixedOffset::east_opt(-5 * 60 * 60).unwrap();
+        let dst = FixedOffset::east_opt(-4 * 60 * 60).unwrap();
+        let transitions = [
+            Transition::new(ymdhms(2023, 3, 24, 3, 0, 0), dst, std),
+            Transition::new(ymdhms(2023, 10, 27, 2, 0, 0), std, dst),
+        ];
+        compare_lookup(&transitions, 2023, 3, 24, 1, 0, 0, LocalResult::Single(dst));
+        compare_lookup(&transitions, 2023, 3, 24, 2, 0, 0, LocalResult::Ambiguous(dst, std));
+        compare_lookup(&transitions, 2023, 3, 24, 2, 30, 0, LocalResult::Ambiguous(dst, std));
+        compare_lookup(&transitions, 2023, 3, 24, 3, 0, 0, LocalResult::Ambiguous(dst, std));
+        compare_lookup(&transitions, 2023, 3, 24, 4, 0, 0, LocalResult::Single(std));
+
+        compare_lookup(&transitions, 2023, 10, 27, 1, 0, 0, LocalResult::Single(std));
+        compare_lookup(&transitions, 2023, 10, 27, 2, 0, 0, LocalResult::Single(std));
+        compare_lookup(&transitions, 2023, 10, 27, 2, 30, 0, LocalResult::None);
+        compare_lookup(&transitions, 2023, 10, 27, 3, 0, 0, LocalResult::Single(dst));
+        compare_lookup(&transitions, 2023, 10, 27, 4, 0, 0, LocalResult::Single(dst));
+
+        // dst transition before std transition
+        // dst offset < std offset
+        let std = FixedOffset::east_opt(3 * 60 * 60).unwrap();
+        let dst = FixedOffset::east_opt((2 * 60 + 30) * 60).unwrap();
+        let transitions = [
+            Transition::new(ymdhms(2023, 3, 26, 2, 30, 0), std, dst),
+            Transition::new(ymdhms(2023, 10, 29, 2, 0, 0), dst, std),
+        ];
+        compare_lookup(&transitions, 2023, 3, 26, 1, 0, 0, LocalResult::Single(std));
+        compare_lookup(&transitions, 2023, 3, 26, 2, 0, 0, LocalResult::Ambiguous(std, dst));
+        compare_lookup(&transitions, 2023, 3, 26, 2, 15, 0, LocalResult::Ambiguous(std, dst));
+        compare_lookup(&transitions, 2023, 3, 26, 2, 30, 0, LocalResult::Ambiguous(std, dst));
+        compare_lookup(&transitions, 2023, 3, 26, 3, 0, 0, LocalResult::Single(dst));
+
+        compare_lookup(&transitions, 2023, 10, 29, 1, 0, 0, LocalResult::Single(dst));
+        compare_lookup(&transitions, 2023, 10, 29, 2, 0, 0, LocalResult::Single(dst));
+        compare_lookup(&transitions, 2023, 10, 29, 2, 15, 0, LocalResult::None);
+        compare_lookup(&transitions, 2023, 10, 29, 2, 30, 0, LocalResult::Single(std));
+        compare_lookup(&transitions, 2023, 10, 29, 3, 0, 0, LocalResult::Single(std));
+
+        // std transition before dst transition
+        // dst offset < std offset
+        let std = FixedOffset::east_opt(-(4 * 60 + 30) * 60).unwrap();
+        let dst = FixedOffset::east_opt(-5 * 60 * 60).unwrap();
+        let transitions = [
+            Transition::new(ymdhms(2023, 3, 24, 2, 0, 0), dst, std),
+            Transition::new(ymdhms(2023, 10, 27, 2, 30, 0), std, dst),
+        ];
+        compare_lookup(&transitions, 2023, 3, 24, 1, 0, 0, LocalResult::Single(dst));
+        compare_lookup(&transitions, 2023, 3, 24, 2, 0, 0, LocalResult::Single(dst));
+        compare_lookup(&transitions, 2023, 3, 24, 2, 15, 0, LocalResult::None);
+        compare_lookup(&transitions, 2023, 3, 24, 2, 30, 0, LocalResult::Single(std));
+        compare_lookup(&transitions, 2023, 3, 24, 3, 0, 0, LocalResult::Single(std));
+
+        compare_lookup(&transitions, 2023, 10, 27, 1, 0, 0, LocalResult::Single(std));
+        compare_lookup(&transitions, 2023, 10, 27, 2, 0, 0, LocalResult::Ambiguous(std, dst));
+        compare_lookup(&transitions, 2023, 10, 27, 2, 15, 0, LocalResult::Ambiguous(std, dst));
+        compare_lookup(&transitions, 2023, 10, 27, 2, 30, 0, LocalResult::Ambiguous(std, dst));
+        compare_lookup(&transitions, 2023, 10, 27, 3, 0, 0, LocalResult::Single(dst));
+
+        // offset stays the same
+        let std = FixedOffset::east_opt(3 * 60 * 60).unwrap();
+        let transitions = [
+            Transition::new(ymdhms(2023, 3, 26, 2, 0, 0), std, std),
+            Transition::new(ymdhms(2023, 10, 29, 3, 0, 0), std, std),
+        ];
+        compare_lookup(&transitions, 2023, 3, 26, 2, 0, 0, LocalResult::Single(std));
+        compare_lookup(&transitions, 2023, 10, 29, 3, 0, 0, LocalResult::Single(std));
+    }
+
+    /// Test Issue #866
+    #[test]
+    fn test_issue_866() {
+        #[allow(deprecated)]
+        let local_20221106 = Local.ymd(2022, 11, 6);
+        let _dt_20221106 = local_20221106.and_hms_milli_opt(1, 2, 59, 1000).unwrap();
     }
 }
